@@ -1,0 +1,130 @@
+# Diese Datei gehört in GitHub nach  .github/workflows/sets.yml
+# Öffentliches Repo: Die Ausgabe des Programms erscheint NICHT im Log. Im Log steht nur eine kurze
+# Zusammenfassung (p1, p2 … und Anzahlen). Das ausführliche Protokoll liegt als passwortgeschütztes
+# 7z-Archiv unter Artifacts (Passwort = Secret LOG_PASSWORD).
+name: Sets bauen
+
+on:
+  schedule:
+    # Vormittag (Zeiten in UTC, polnische Winterzeit = UTC + 1)
+    - cron: "17 4 * * *"
+    - cron: "47 5 * * *"
+    - cron: "23 7 * * *"
+    # Nachmittag
+    - cron: "17 12 * * *"
+    - cron: "47 13 * * *"
+  workflow_dispatch:
+    inputs:
+      profil:
+        description: "Nur ein Profil (leer = alle)"
+        required: false
+        default: ""
+        type: choice
+        options: ["", "p1", "p2", "p3", "p4"]
+      limit:
+        description: "Sets pro Profil (leer = limit_per_run)"
+        required: false
+        default: ""
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: sets
+  cancel-in-progress: false
+
+jobs:
+  sets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Schon gelaufen?
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          TODAY=$(date -u +%Y-%m-%d)
+          if [ "$(date -u +%H)" -lt 11 ]; then FROM="${TODAY}T00:00:00Z"; TO="${TODAY}T10:59:59Z"
+          else FROM="${TODAY}T11:00:00Z"; TO="${TODAY}T23:59:59Z"; fi
+          N=$(gh api "repos/${{ github.repository }}/actions/workflows/sets.yml/runs?created=${FROM}..${TO}&per_page=50" \
+                --jq '[.workflow_runs[] | select(.id != ${{ github.run_id }}) | select(.conclusion != "cancelled")] | length')
+          if [ "${N:-0}" -gt 0 ]; then echo "Heute in diesem Zeitfenster schon gelaufen."; echo "run=false" >> "$GITHUB_OUTPUT"
+          else echo "run=true" >> "$GITHUB_OUTPUT"; fi
+
+      - uses: actions/checkout@v4
+        if: steps.check.outputs.run == 'true'
+
+      - uses: actions/setup-python@v5
+        if: steps.check.outputs.run == 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Pakete installieren
+        if: steps.check.outputs.run == 'true'
+        run: pip install -q -r requirements.txt
+
+      - name: Einstellungen aus den Secrets schreiben
+        if: steps.check.outputs.run == 'true'
+        env:
+          ENV_FILE: ${{ secrets.ENV_FILE }}
+          PROFILES_YAML: ${{ secrets.PROFILES_YAML }}
+        run: |
+          printf '%s\n' "$ENV_FILE" | tr -d '\r' > .env
+          python - <<'PY'
+          import os, pathlib, yaml
+          d = yaml.safe_load(os.environ["PROFILES_YAML"].replace("\r", "")) or {}
+          for name, text in d.items():
+              pathlib.Path(name).mkdir(exist_ok=True)
+              pathlib.Path(name, "rules.yaml").write_text(text, encoding="utf-8")
+          pathlib.Path("profiles.txt").write_text(",".join(d), encoding="utf-8")
+          print(f"{len(d)} Profile.")
+          PY
+
+      - name: Sets bauen
+        id: run
+        if: steps.check.outputs.run == 'true'
+        env:
+          PROFIL: ${{ github.event.inputs.profil }}
+          LIMIT: ${{ github.event.inputs.limit }}
+        run: |
+          PROFILES="${PROFIL:-$(cat profiles.txt)}"
+          FIRST="${PROFILES%%,*}"
+          set +e
+          python -m allegro_sets --rules "$FIRST/rules.yaml" catalog-all \
+            --profiles "$PROFILES" --limit "${LIMIT:-0}" --max-minutes 320 > ausgabe.txt 2>&1
+          RC=$?
+          set -e
+          LOG=$(ls -t Protokolle/*.txt 2>/dev/null | head -1)
+          if [ -n "$LOG" ] && grep -q "=== Ergebnis ===" "$LOG"; then
+            sed -n '/=== Ergebnis ===/,$p' "$LOG" | grep -v "Protokoll:"
+          else
+            echo "Lauf ohne Ergebnis beendet (Code $RC). Details im verschlüsselten Protokoll."
+          fi
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+
+      - name: Protokolle verschlüsseln
+        if: always() && steps.check.outputs.run == 'true'
+        env:
+          LOG_PASSWORD: ${{ secrets.LOG_PASSWORD }}
+        run: |
+          if [ -z "$LOG_PASSWORD" ]; then echo "Secret LOG_PASSWORD fehlt: Protokolle werden nicht hochgeladen."; exit 0; fi
+          command -v 7z >/dev/null || sudo apt-get install -y -qq p7zip-full >/dev/null
+          FILES=$(ls -d Protokolle ausgabe.txt */build_report*.csv 2>/dev/null || true)
+          [ -n "$FILES" ] && 7z a -bso0 -bsp0 -mhe=on -p"$LOG_PASSWORD" protokolle.7z $FILES
+          rm -rf Protokolle ausgabe.txt */build_report*.csv .env
+
+      - name: Protokolle speichern
+        if: always() && steps.check.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: protokolle
+          path: protokolle.7z
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Fehler melden
+        if: steps.check.outputs.run == 'true' && steps.run.outputs.rc != '0'
+        run: exit 1
