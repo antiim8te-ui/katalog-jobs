@@ -1,0 +1,9 @@
+.env
+data/
+__pycache__/
+Protokolle/
+*/Protokolle/
+*.csv
+*.7z
+ausgabe.txt
+profiles.txt
